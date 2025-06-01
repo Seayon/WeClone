@@ -3,6 +3,8 @@ import sys
 import subprocess
 from typing import Dict, List, Union
 import re
+import concurrent.futures
+import threading
 
 import pandas as pd
 import json
@@ -18,15 +20,13 @@ from weclone.data.strategies import TimeWindowStrategy, LLMStrategy
 
 
 class DataProcessor:
-    def __init__(self, input_dir=None, output_dir=None, output_file=None):
+    def __init__(self, parallel_degree=1):
         self.config = load_config(arg_type="make_dataset")
-        self.csv_folder = input_dir or "./dataset/csv"
-        self.output_dir = output_dir or "./dataset/res_csv/sft"
-        self.output_file = output_file or "sft-my.json"
-        
-        # 如果用户指定了输出目录，更新dataset_dir
-        if output_dir and output_dir != "./dataset/res_csv/sft":
-            self.config["dataset_dir"] = output_dir
+        self.csv_folder = "./dataset/csv"
+        self.parallel_degree = parallel_degree
+        self.temp_dir = "./dataset/temp_results"
+        self.processed_record_file = "./dataset/processed_folders.txt"
+        self.lock = threading.Lock()  # 用于线程安全的文件操作
         self.system_prompt = self.config["default_system"]
         self.cut_type_list = [
             "图片",
@@ -99,29 +99,176 @@ class DataProcessor:
             logger.error(f"错误：目录 '{self.csv_folder}' 不存在或为空，请检查路径并确保其中包含 CSV 聊天数据文件。")
             return
 
-        csv_files = self.get_csv_files()
-        logger.info(f"共发现 {len(csv_files)} 个 CSV 文件，开始处理")
+        # 获取CSV子文件夹列表
+        subfolders = self._get_csv_subfolders()
+        if not subfolders:
+            logger.error("未找到任何CSV子文件夹")
+            return
+        
+        logger.info(f"共发现 {len(subfolders)} 个子文件夹")
+        
+        # 检查已处理的子文件夹记录
+        processed_folders = self._get_processed_folders()
+        pending_folders = [f for f in subfolders if f not in processed_folders]
+        
+        if not pending_folders:
+            logger.info("所有子文件夹已处理完成，开始合并结果")
+            self._merge_results()
+            return
+        
+        logger.info(f"待处理子文件夹: {len(pending_folders)} 个，并行度: {self.parallel_degree}")
+        
+        # 创建临时目录
+        os.makedirs(self.temp_dir, exist_ok=True)
+        
+        # 创建线程池并行处理子文件夹
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel_degree) as executor:
+            futures = {}
+            for subfolder in pending_folders:
+                future = executor.submit(self._process_subfolder, subfolder)
+                futures[future] = subfolder
+            
+            # 等待所有任务完成
+            for future in concurrent.futures.as_completed(futures):
+                subfolder = futures[future]
+                try:
+                    result = future.result()
+                    logger.success(f"子文件夹 {subfolder} 处理完成，共 {result} 条记录")
+                except Exception as e:
+                    logger.error(f"子文件夹 {subfolder} 处理失败: {str(e)}")
+        
+        # 合并所有中间结果
+        self._merge_results()
+        
+        # 执行length_cdf脚本
+        self._execute_length_cdf_script()
+
+    def _get_csv_subfolders(self):
+        """获取CSV子文件夹列表"""
+        subfolders = []
+        for item in os.listdir(self.csv_folder):
+            item_path = os.path.join(self.csv_folder, item)
+            if os.path.isdir(item_path):
+                # 检查子文件夹中是否有CSV文件
+                has_csv = any(f.endswith('.csv') for f in os.listdir(item_path))
+                if has_csv:
+                    subfolders.append(item)
+        return subfolders
+    
+    def _get_processed_folders(self):
+        """获取已处理的子文件夹列表"""
+        if not os.path.exists(self.processed_record_file):
+            return []
+        
+        with open(self.processed_record_file, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip()]
+    
+    def _mark_folder_processed(self, subfolder):
+        """标记子文件夹已处理"""
+        with self.lock:  # 线程安全
+            with open(self.processed_record_file, "a", encoding="utf-8") as f:
+                f.write(f"{subfolder}\n")
+    
+    def _process_subfolder(self, subfolder):
+        """处理单个子文件夹并保存中间结果"""
+        logger.info(f"开始处理子文件夹: {subfolder}")
+        subfolder_path = os.path.join(self.csv_folder, subfolder)
+        
+        # 获取该子文件夹中的所有CSV文件
+        csv_files = []
+        for csvfile in os.listdir(subfolder_path):
+            if not csvfile.endswith(".csv"):
+                continue
+            csvfile_path = os.path.join(subfolder_path, csvfile)
+            csv_files.append(csvfile_path)
+        
+        # 按文件名排序
+        csv_files.sort(key=self._extract_start_number)
+        
+        # 处理该子文件夹中的所有文件
         message_list: List[ChatMessage] = []
         for csv_file in csv_files:
             logger.debug(f"开始处理 CSV 文件: {csv_file}")
             chat_messages = self.load_csv(csv_file)
             message_list.extend(self.group_consecutive_messages(messages=chat_messages))
-            # self.process_by_msgtype(chat_message)
             logger.debug(f"处理完成: {csv_file}，共加载 {len(chat_messages)} 条消息")
+        
+        # 匹配问答对
         qa_res = self.match_qa(message_list)
         if self.c["prompt_with_history"]:
             qa_res = self.add_history_to_qa(qa_res)
         else:
             qa_res = [item for item in qa_res if isinstance(item, QaPair)]
-
+        
+        # 如果启用了数据清洗
         if self.c.get("clean_dataset", {}).get("enable_clean", False):
             self.clean_strategy.judge(qa_res)
-            # qa_res = self.clean_strategy.clean(qa_res)
-        self.save_result(qa_res)
-        self._execute_length_cdf_script()
-
-        output_path = os.path.join(self.output_dir, self.output_file)
-        logger.success(f"聊天记录处理成功，共{len(qa_res)}条，保存到 {output_path}")
+        
+        # 保存该子文件夹的中间结果
+        self._save_intermediate_result(subfolder, qa_res)
+        
+        # 标记该子文件夹已处理
+        self._mark_folder_processed(subfolder)
+        
+        return len(qa_res)
+    
+    def _extract_start_number(self, filepath):
+        """从文件路径中提取起始数字用于排序"""
+        import re
+        filename = os.path.basename(filepath)
+        pattern = re.compile(r"_(\d+)_\d+\.csv$")
+        match = pattern.search(filename)
+        return int(match.group(1)) if match else 0
+    
+    def _save_intermediate_result(self, subfolder, qa_res):
+        """保存子文件夹的中间结果"""
+        processed_qa_res = []
+        for idx, item in enumerate(qa_res):
+            item_dict = {
+                "id": idx,
+                "system": item.system,
+                "instruction": item.instruction,
+                "output": item.output,
+                "history": item.history,
+                "time": item.time.isoformat() if item.time else None,
+                "score": item.score,
+            }
+            processed_qa_res.append(item_dict)
+        
+        temp_file = os.path.join(self.temp_dir, f"{subfolder}.json")
+        with self.lock:  # 线程安全
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(processed_qa_res, f, ensure_ascii=False, indent=4)
+        
+        logger.info(f"子文件夹 {subfolder} 中间结果已保存: {temp_file}")
+    
+    def _merge_results(self):
+        """合并所有中间结果为最终结果"""
+        if not os.path.exists(self.temp_dir):
+            logger.warning("没有找到中间结果目录")
+            return
+        
+        all_qa_res = []
+        temp_files = [f for f in os.listdir(self.temp_dir) if f.endswith(".json")]
+        temp_files.sort()  # 确保顺序一致
+        
+        for temp_file in temp_files:
+            temp_file_path = os.path.join(self.temp_dir, temp_file)
+            with open(temp_file_path, "r", encoding="utf-8") as f:
+                qa_items = json.load(f)
+                all_qa_res.extend(qa_items)
+        
+        # 重新分配ID
+        for idx, item in enumerate(all_qa_res):
+            item["id"] = idx
+        
+        # 保存合并后的结果
+        output_path = "./dataset/res_csv/sft/sft-my.json"
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(all_qa_res, f, ensure_ascii=False, indent=4)
+        
+        logger.success(f"所有中间结果已合并，共{len(all_qa_res)}条，保存到 {output_path}")
 
     def _execute_length_cdf_script(self):
         """执行 length_cdf.py 脚本来计算cutoff_len。"""
@@ -480,74 +627,6 @@ class DataProcessor:
 
     def process_text(self, chat_message: ChatMessage):
         pass
-
-    def save_result(self, qa_res: List[QaPair]):
-        """
-        Saves the list of QaPair objects to a JSON file after converting them to dictionaries.
-
-        Args:
-            qa_res: A list of QaPair objects.
-        """
-        processed_qa_res = []
-        for idx, item in enumerate(qa_res):
-            item_dict = {
-                "id": idx,
-                "system": item.system,
-                "instruction": item.instruction,
-                "output": item.output,
-                "history": item.history,
-                "time": item.time.isoformat() if item.time else None,
-                "score": item.score,
-            }
-            processed_qa_res.append(item_dict)
-
-        output_path = os.path.join(self.output_dir, self.output_file)
-        os.makedirs(self.output_dir, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(processed_qa_res, f, ensure_ascii=False, indent=4)
-        
-        # 创建dataset_info.json文件
-        self._create_dataset_info()
-        
-        logger.success(f"聊天记录处理成功，共{len(qa_res)}条，保存到 {output_path}")
-
-    def _create_dataset_info(self):
-        """
-        创建dataset_info.json文件，用于LlamaFactory数据集配置
-        """
-        dataset_info_path = os.path.join(self.output_dir, "dataset_info.json")
-        
-        # 检查是否已存在dataset_info.json文件
-        if os.path.exists(dataset_info_path):
-            return
-            
-        # 创建dataset_info配置
-        dataset_info = {
-            "wechat-sft": {
-                "file_name": f"./{self.output_file}",
-                "columns": {
-                    "prompt": "instruction",
-                    "response": "output",
-                    "system": "system"
-                }
-            },
-            "wechat-sft-with-history": {
-                "file_name": f"./{self.output_file}",
-                "columns": {
-                    "prompt": "instruction",
-                    "response": "output",
-                    "system": "system",
-                    "history": "history"
-                }
-            }
-        }
-        
-        # 保存dataset_info.json文件
-        with open(dataset_info_path, "w", encoding="utf-8") as f:
-            json.dump(dataset_info, f, ensure_ascii=False, indent=4)
-        
-        logger.info(f"已创建数据集配置文件: {dataset_info_path}")
-
 
 if __name__ == "__main__":
     processor = DataProcessor()

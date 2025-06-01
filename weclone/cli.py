@@ -64,15 +64,13 @@ def cli():
 
 
 @cli.command("make-dataset", help="处理聊天记录CSV文件，生成问答对数据集。")
-@click.option("--input-dir", "-i", default="./dataset/csv", help="输入CSV文件目录")
-@click.option("--output-dir", "-o", default="./dataset/res_csv/sft", help="输出目录")
-@click.option("--output-file", "-f", default="sft-my.json", help="输出文件名")
+@click.option("--parallel", "-p", default=1, help="并行处理的子文件夹数量")
 @apply_common_decorators()
-def qa_generator(input_dir, output_dir, output_file):
+def qa_generator(parallel):
     """处理聊天记录CSV文件，生成问答对数据集。"""
     from weclone.data.qa_generator import DataProcessor
 
-    processor = DataProcessor(input_dir=input_dir, output_dir=output_dir, output_file=output_file)
+    processor = DataProcessor(parallel_degree=parallel)
     processor.main()
 
 
