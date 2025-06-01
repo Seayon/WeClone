@@ -18,9 +18,15 @@ from weclone.data.strategies import TimeWindowStrategy, LLMStrategy
 
 
 class DataProcessor:
-    def __init__(self):
+    def __init__(self, input_dir=None, output_dir=None, output_file=None):
         self.config = load_config(arg_type="make_dataset")
-        self.csv_folder = "./dataset/csv"
+        self.csv_folder = input_dir or "./dataset/csv"
+        self.output_dir = output_dir or "./dataset/res_csv/sft"
+        self.output_file = output_file or "sft-my.json"
+        
+        # 如果用户指定了输出目录，更新dataset_dir
+        if output_dir and output_dir != "./dataset/res_csv/sft":
+            self.config["dataset_dir"] = output_dir
         self.system_prompt = self.config["default_system"]
         self.cut_type_list = [
             "图片",
@@ -114,7 +120,8 @@ class DataProcessor:
         self.save_result(qa_res)
         self._execute_length_cdf_script()
 
-        logger.success(f"聊天记录处理成功，共{len(qa_res)}条，保存到 ./dataset/res_csv/sft/sft-my.json")
+        output_path = os.path.join(self.output_dir, self.output_file)
+        logger.success(f"聊天记录处理成功，共{len(qa_res)}条，保存到 {output_path}")
 
     def _execute_length_cdf_script(self):
         """执行 length_cdf.py 脚本来计算cutoff_len。"""
@@ -494,7 +501,7 @@ class DataProcessor:
             }
             processed_qa_res.append(item_dict)
 
-        output_path = "./dataset/res_csv/sft/sft-my.json"
+        output_path = os.path.join(self.output_dir, self.output_file)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(processed_qa_res, f, ensure_ascii=False, indent=4)
