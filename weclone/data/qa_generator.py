@@ -502,10 +502,51 @@ class DataProcessor:
             processed_qa_res.append(item_dict)
 
         output_path = os.path.join(self.output_dir, self.output_file)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(processed_qa_res, f, ensure_ascii=False, indent=4)
+        
+        # 创建dataset_info.json文件
+        self._create_dataset_info()
+        
         logger.success(f"聊天记录处理成功，共{len(qa_res)}条，保存到 {output_path}")
+
+    def _create_dataset_info(self):
+        """
+        创建dataset_info.json文件，用于LlamaFactory数据集配置
+        """
+        dataset_info_path = os.path.join(self.output_dir, "dataset_info.json")
+        
+        # 检查是否已存在dataset_info.json文件
+        if os.path.exists(dataset_info_path):
+            return
+            
+        # 创建dataset_info配置
+        dataset_info = {
+            "wechat-sft": {
+                "file_name": f"./{self.output_file}",
+                "columns": {
+                    "prompt": "instruction",
+                    "response": "output",
+                    "system": "system"
+                }
+            },
+            "wechat-sft-with-history": {
+                "file_name": f"./{self.output_file}",
+                "columns": {
+                    "prompt": "instruction",
+                    "response": "output",
+                    "system": "system",
+                    "history": "history"
+                }
+            }
+        }
+        
+        # 保存dataset_info.json文件
+        with open(dataset_info_path, "w", encoding="utf-8") as f:
+            json.dump(dataset_info, f, ensure_ascii=False, indent=4)
+        
+        logger.info(f"已创建数据集配置文件: {dataset_info_path}")
 
 
 if __name__ == "__main__":
